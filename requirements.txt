@@ -1,0 +1,8 @@
+# Minimal dependencies for PE File Parser
+colorama==0.4.6
+
+# Optional (uncomment if needed)
+# rich==13.7.0
+# hexdump==3.3
+# pefile==2023.2.7
+# lief==0.13.2
