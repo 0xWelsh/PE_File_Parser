@@ -10,6 +10,15 @@
 
 #define PACKED __attribute__((packed))
 
+// Helper function to read little-endian values
+static uint16_t read_le16(const uint8_t* data) {
+    return data[0] | (data[1] << 8);
+}
+
+static uint32_t read_le32(const uint8_t* data) {
+    return data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
+}
+
 typedef struct PACKED {
     uint16_t e_magic;      // "MZ"
     uint8_t  e_cblp[58];
@@ -26,10 +35,6 @@ typedef struct PACKED {
     uint16_t SizeOfOptionalHeader;
     uint16_t Characteristics;
 } IMAGE_FILE_HEADER;
-
-typedef struct PACKED {
-    uint16_t Magic;
-} IMAGE_OPTIONAL_HEADER;
 
 #define IMAGE_NT_SIGNATURE          0x00004550  // "PE\0\0"
 #define IMAGE_NT_OPTIONAL_HDR32_MAGIC 0x010b
@@ -81,60 +86,72 @@ int parse_pe(const char* filepath) {
     }
 
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)data;
-    if (dos->e_magic != 0x5A4D) { // 'M' = 0x4D, 'Z' = 0x5A → little-endian: 0x5A4D
+    if (dos->e_magic != 0x5A4D) { // 'MZ'
         fprintf(stderr, "Invalid DOS header (not MZ)\n");
         free(data);
         return -1;
     }
 
-    uint32_t pe_offset = dos->e_lfanew;
+    // Read e_lfanew using our helper to ensure correct endianness
+    uint32_t pe_offset = read_le32((uint8_t*)&dos->e_lfanew);
+    printf("PE header offset: 0x%08x\n", pe_offset);
+    
     if (pe_offset == 0 || pe_offset > file_size - 4) {
-        fprintf(stderr, "Invalid e_lfanew offset\n");
+        fprintf(stderr, "Invalid e_lfanew offset: 0x%08x (file size: 0x%08zx)\n", 
+                pe_offset, file_size);
         free(data);
         return -1;
     }
 
-    uint32_t sig = *(uint32_t*)(data + pe_offset);
+    uint32_t sig = read_le32(data + pe_offset);
     if (sig != IMAGE_NT_SIGNATURE) {
-        fprintf(stderr, "Invalid PE signature (expected 'PE\\0\\0')\n");
+        fprintf(stderr, "Invalid PE signature: 0x%08x (expected 0x%08x)\n", 
+                sig, IMAGE_NT_SIGNATURE);
         free(data);
         return -1;
     }
 
-    if (pe_offset + 4 + sizeof(IMAGE_FILE_HEADER) > file_size) {
+    uint32_t file_hdr_offset = pe_offset + 4;
+    if (file_hdr_offset + sizeof(IMAGE_FILE_HEADER) > file_size) {
         fprintf(stderr, "File too small for PE file header\n");
         free(data);
         return -1;
     }
 
-    IMAGE_FILE_HEADER* file_hdr = (IMAGE_FILE_HEADER*)(data + pe_offset + 4);
-    printf("Machine: 0x%04x\n", file_hdr->Machine);
-    printf("Sections: %u\n", file_hdr->NumberOfSections);
+    // Read file header fields manually to avoid endianness issues
+    uint8_t* file_hdr_ptr = data + file_hdr_offset;
+    uint16_t machine = read_le16(file_hdr_ptr + 0);
+    uint16_t num_sections = read_le16(file_hdr_ptr + 2);
+    uint16_t opt_header_size = read_le16(file_hdr_ptr + 16);
+    
+    printf("Machine: 0x%04x\n", machine);
+    printf("Sections: %u\n", num_sections);
 
-    if (file_hdr->NumberOfSections > MAX_SECTIONS) {
-        fprintf(stderr, "Suspicious number of sections (%u)\n", file_hdr->NumberOfSections);
+    if (num_sections > MAX_SECTIONS) {
+        fprintf(stderr, "Suspicious number of sections (%u)\n", num_sections);
         free(data);
         return -1;
     }
 
-    uint32_t opt_hdr_offset = pe_offset + 4 + sizeof(IMAGE_FILE_HEADER);
+    uint32_t opt_hdr_offset = file_hdr_offset + 20; // sizeof(IMAGE_FILE_HEADER)
     if (opt_hdr_offset + 2 > file_size) {
         fprintf(stderr, "Optional header out of bounds\n");
         free(data);
         return -1;
     }
 
-    IMAGE_OPTIONAL_HEADER* opt_hdr = (IMAGE_OPTIONAL_HEADER*)(data + opt_hdr_offset);
-    if (opt_hdr->Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+    // Read optional header magic
+    uint16_t opt_magic = read_le16(data + opt_hdr_offset);
+    if (opt_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
         printf("PE format: PE32\n");
-    } else if (opt_hdr->Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+    } else if (opt_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
         printf("PE format: PE32+\n");
     } else {
-        printf("Unknown PE optional header magic: 0x%04x\n", opt_hdr->Magic);
+        printf("Unknown PE optional header magic: 0x%04x\n", opt_magic);
     }
 
-    uint32_t sec_offset = opt_hdr_offset + file_hdr->SizeOfOptionalHeader;
-    size_t sec_table_size = (size_t)file_hdr->NumberOfSections * IMAGE_SIZEOF_SECTION_HEADER;
+    uint32_t sec_offset = opt_hdr_offset + opt_header_size;
+    size_t sec_table_size = (size_t)num_sections * IMAGE_SIZEOF_SECTION_HEADER;
 
     if (sec_offset > file_size || sec_table_size > file_size - sec_offset) {
         fprintf(stderr, "Section headers exceed file bounds\n");
@@ -143,19 +160,20 @@ int parse_pe(const char* filepath) {
     }
 
     printf("\nSections:\n");
-    for (int i = 0; i < file_hdr->NumberOfSections; i++) {
+    for (int i = 0; i < num_sections; i++) {
         uint8_t* sec = data + sec_offset + i * IMAGE_SIZEOF_SECTION_HEADER;
         char name[9];
         memcpy(name, sec, 8);
         name[8] = '\0';
 
-        // Manually read fields to avoid alignment issues (though PACKED should handle it)
-        uint32_t virt_size   = *(uint32_t*)(sec + 8);
-        uint32_t virt_addr   = *(uint32_t*)(sec + 12);
-        uint32_t raw_size    = *(uint32_t*)(sec + 16);
+        // Read section fields using helper functions
+        uint32_t virt_size   = read_le32(sec + 8);
+        uint32_t virt_addr   = read_le32(sec + 12);
+        uint32_t raw_size    = read_le32(sec + 16);
+        uint32_t raw_addr    = read_le32(sec + 20);
 
-        printf("  [%02d] %-8s  VA=0x%08x  VSz=0x%08x  RSz=0x%08x\n",
-               i, name, virt_addr, virt_size, raw_size);
+        printf("  [%02d] %-8s  VA=0x%08x  VSz=0x%08x  RSz=0x%08x  RAddr=0x%08x\n",
+               i, name, virt_addr, virt_size, raw_size, raw_addr);
     }
 
     free(data);
