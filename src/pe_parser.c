@@ -36,6 +36,7 @@ typedef struct PACKED {
 #define IMAGE_NT_OPTIONAL_HDR64_MAGIC 0x020b
 
 #define MAX_SECTIONS 96
+#define IMAGE_SIZEOF_SECTION_HEADER 40
 
 int parse_pe(const char* filepath) {
     FILE* f = fopen(filepath, "rb");
@@ -51,6 +52,12 @@ int parse_pe(const char* filepath) {
         return -1;
     }
     size_t file_size = st.st_size;
+
+    if (file_size == 0) {
+        fprintf(stderr, "File is empty\n");
+        fclose(f);
+        return -1;
+    }
 
     uint8_t* data = malloc(file_size);
     if (!data) {
@@ -74,22 +81,28 @@ int parse_pe(const char* filepath) {
     }
 
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)data;
-    if (dos->e_magic != 0x5A4D) { // "MZ"
+    if (dos->e_magic != 0x5A4D) { // 'M' = 0x4D, 'Z' = 0x5A → little-endian: 0x5A4D
         fprintf(stderr, "Invalid DOS header (not MZ)\n");
         free(data);
         return -1;
     }
 
     uint32_t pe_offset = dos->e_lfanew;
-    if (pe_offset >= file_size || pe_offset + 4 + sizeof(IMAGE_FILE_HEADER) > file_size) {
-        fprintf(stderr, "Invalid PE header offset\n");
+    if (pe_offset == 0 || pe_offset > file_size - 4) {
+        fprintf(stderr, "Invalid e_lfanew offset\n");
         free(data);
         return -1;
     }
 
     uint32_t sig = *(uint32_t*)(data + pe_offset);
     if (sig != IMAGE_NT_SIGNATURE) {
-        fprintf(stderr, "Invalid PE signature (not PE\\0\\0)\n");
+        fprintf(stderr, "Invalid PE signature (expected 'PE\\0\\0')\n");
+        free(data);
+        return -1;
+    }
+
+    if (pe_offset + 4 + sizeof(IMAGE_FILE_HEADER) > file_size) {
+        fprintf(stderr, "File too small for PE file header\n");
         free(data);
         return -1;
     }
@@ -121,7 +134,9 @@ int parse_pe(const char* filepath) {
     }
 
     uint32_t sec_offset = opt_hdr_offset + file_hdr->SizeOfOptionalHeader;
-    if (sec_offset + (size_t)file_hdr->NumberOfSections * 40 > file_size) {
+    size_t sec_table_size = (size_t)file_hdr->NumberOfSections * IMAGE_SIZEOF_SECTION_HEADER;
+
+    if (sec_offset > file_size || sec_table_size > file_size - sec_offset) {
         fprintf(stderr, "Section headers exceed file bounds\n");
         free(data);
         return -1;
@@ -129,14 +144,15 @@ int parse_pe(const char* filepath) {
 
     printf("\nSections:\n");
     for (int i = 0; i < file_hdr->NumberOfSections; i++) {
-        uint8_t* sec = data + sec_offset + i * 40;
+        uint8_t* sec = data + sec_offset + i * IMAGE_SIZEOF_SECTION_HEADER;
         char name[9];
         memcpy(name, sec, 8);
         name[8] = '\0';
 
-        uint32_t virt_addr = *(uint32_t*)(sec + 12);
-        uint32_t virt_size = *(uint32_t*)(sec + 8);
-        uint32_t raw_size  = *(uint32_t*)(sec + 16);
+        // Manually read fields to avoid alignment issues (though PACKED should handle it)
+        uint32_t virt_size   = *(uint32_t*)(sec + 8);
+        uint32_t virt_addr   = *(uint32_t*)(sec + 12);
+        uint32_t raw_size    = *(uint32_t*)(sec + 16);
 
         printf("  [%02d] %-8s  VA=0x%08x  VSz=0x%08x  RSz=0x%08x\n",
                i, name, virt_addr, virt_size, raw_size);
