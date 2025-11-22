@@ -1,19 +1,23 @@
+// pe_parser.c
+// Compile: gcc -Wall -O2 pe_parser.c -o pe_parser
+// Usage: ./pe_parser target.exe
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
-// windows headers
-typedef struct {
-    uint16_t e_magic;
-    uint8_t e_cblp[58];
-    uint32_t e_lfanew;
+#define PACKED __attribute__((packed))
+
+typedef struct PACKED {
+    uint16_t e_magic;      // "MZ"
+    uint8_t  e_cblp[58];
+    uint32_t e_lfanew;     // Offset to PE header
 } IMAGE_DOS_HEADER;
 
-
-typedef struct {
-    uint32_t Signature;
+typedef struct PACKED {
+    uint32_t Signature;           // "PE\0\0"
     uint16_t Machine;
     uint16_t NumberOfSections;
     uint32_t TimeDateStamp;
@@ -23,44 +27,69 @@ typedef struct {
     uint16_t Characteristics;
 } IMAGE_FILE_HEADER;
 
-#define IMAGE_NT_OPTIONAL_HDR32_MAGIC 0x10b
-#define IMAGE_NT_OPTIONAL_HDR64_MAGIC 0x20b
-
-typedef struct {
+typedef struct PACKED {
     uint16_t Magic;
-    // we omit the rest for brevity - we only check Magic
 } IMAGE_OPTIONAL_HEADER;
+
+#define IMAGE_NT_SIGNATURE          0x00004550  // "PE\0\0"
+#define IMAGE_NT_OPTIONAL_HDR32_MAGIC 0x010b
+#define IMAGE_NT_OPTIONAL_HDR64_MAGIC 0x020b
+
+#define MAX_SECTIONS 96
 
 int parse_pe(const char* filepath) {
     FILE* f = fopen(filepath, "rb");
-    if (!f) { perror("fopen"); return -1; }
+    if (!f) {
+        perror("fopen");
+        return -1;
+    }
 
     struct stat st;
-    if (fstat(fileno(f), &st) != 0) { perror("fstat"); fclose(f); return -1; }
-    size_t size = st.st_size;
+    if (fstat(fileno(f), &st) != 0) {
+        perror("fstat");
+        fclose(f);
+        return -1;
+    }
+    size_t file_size = st.st_size;
 
-    uint8_t* data = malloc(size);
-    if (!data) { perror("malloc"); fclose(f); return -1; }
-    if (fread(data, 1, size, f) != size) { perror("fread"); free(data); fclose(f); return -1; }
+    uint8_t* data = malloc(file_size);
+    if (!data) {
+        perror("malloc");
+        fclose(f);
+        return -1;
+    }
+
+    if (fread(data, 1, file_size, f) != file_size) {
+        fprintf(stderr, "fread failed\n");
+        free(data);
+        fclose(f);
+        return -1;
+    }
     fclose(f);
 
-
-    // DOS reader
-    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)data;
-    if (dos->e_magic != 0x5A4D) { // "MZ"
-        fprintf(stderr, "Invalid DOS header\n");
+    if (file_size < sizeof(IMAGE_DOS_HEADER)) {
+        fprintf(stderr, "File too small for DOS header\n");
         free(data);
         return -1;
     }
 
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)data;
+    if (dos->e_magic != 0x5A4D) { // "MZ"
+        fprintf(stderr, "Invalid DOS header (not MZ)\n");
+        free(data);
+        return -1;
+    }
 
-    // NT headers
     uint32_t pe_offset = dos->e_lfanew;
-    if (pe_offset >= size) { fprintf(stderr, "Invalid PE offset\n"); free(data); return -1; }
+    if (pe_offset >= file_size || pe_offset + 4 + sizeof(IMAGE_FILE_HEADER) > file_size) {
+        fprintf(stderr, "Invalid PE header offset\n");
+        free(data);
+        return -1;
+    }
 
-    uint32_t* pe_sig = (uint32_t*)(data + pe_offset);
-    if (*pe_sig != 0x00004550) {
-        fprintf(stderr, "Invalid PE signature\n");
+    uint32_t sig = *(uint32_t*)(data + pe_offset);
+    if (sig != IMAGE_NT_SIGNATURE) {
+        fprintf(stderr, "Invalid PE signature (not PE\\0\\0)\n");
         free(data);
         return -1;
     }
@@ -69,24 +98,49 @@ int parse_pe(const char* filepath) {
     printf("Machine: 0x%04x\n", file_hdr->Machine);
     printf("Sections: %u\n", file_hdr->NumberOfSections);
 
-    // optional header (check 32 vs 64)
-    IMAGE_OPTIONAL_HEADER* opt_hdr = (IMAGE_OPTIONAL_HEADER*)(data + pe_offset + 4 + sizeof(IMAGE_FILE_HEADER));
+    if (file_hdr->NumberOfSections > MAX_SECTIONS) {
+        fprintf(stderr, "Suspicious number of sections (%u)\n", file_hdr->NumberOfSections);
+        free(data);
+        return -1;
+    }
+
+    uint32_t opt_hdr_offset = pe_offset + 4 + sizeof(IMAGE_FILE_HEADER);
+    if (opt_hdr_offset + 2 > file_size) {
+        fprintf(stderr, "Optional header out of bounds\n");
+        free(data);
+        return -1;
+    }
+
+    IMAGE_OPTIONAL_HEADER* opt_hdr = (IMAGE_OPTIONAL_HEADER*)(data + opt_hdr_offset);
     if (opt_hdr->Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
         printf("PE format: PE32\n");
     } else if (opt_hdr->Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        printf("PE format: PE32+\n");
+    } else {
         printf("Unknown PE optional header magic: 0x%04x\n", opt_hdr->Magic);
     }
 
-    // section headers
-    uint8_t* section_hdr = data + pe_offset + 4 + sizeof(IMAGE_FILE_HEADER) + file_hdr->SizeOfOptionalHeader;
-    for (int i = 0; i < file_hdr->NumberOfSections; i++) {
-        char name[9];
-        memcpy(name, section_hdr + i * 40, 8);
-        name[8] = '\0';
-        uint32_t va = *(uint32_t*)(section_hdr + i * 40 + 12);
-        printf("Section %d: %s (RVA: 0x%08x)\n", i, name, va);
+    uint32_t sec_offset = opt_hdr_offset + file_hdr->SizeOfOptionalHeader;
+    if (sec_offset + (size_t)file_hdr->NumberOfSections * 40 > file_size) {
+        fprintf(stderr, "Section headers exceed file bounds\n");
+        free(data);
+        return -1;
     }
 
+    printf("\nSections:\n");
+    for (int i = 0; i < file_hdr->NumberOfSections; i++) {
+        uint8_t* sec = data + sec_offset + i * 40;
+        char name[9];
+        memcpy(name, sec, 8);
+        name[8] = '\0';
+
+        uint32_t virt_addr = *(uint32_t*)(sec + 12);
+        uint32_t virt_size = *(uint32_t*)(sec + 8);
+        uint32_t raw_size  = *(uint32_t*)(sec + 16);
+
+        printf("  [%02d] %-8s  VA=0x%08x  VSz=0x%08x  RSz=0x%08x\n",
+               i, name, virt_addr, virt_size, raw_size);
+    }
 
     free(data);
     return 0;
