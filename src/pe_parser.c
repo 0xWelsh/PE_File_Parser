@@ -15,7 +15,7 @@ typedef struct {
 typedef struct {
     uint32_t Signature;
     uint16_t Machine;
-    uint32_t NumberOfSections;
+    uint16_t NumberOfSections;
     uint32_t TimeDateStamp;
     uint32_t PointerToSymbolTable;
     uint32_t NumberOfSymbols;
